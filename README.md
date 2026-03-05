@@ -13,7 +13,7 @@
    2. CQRS
    3. 캐시 전략
    4. 이벤트 기반 비동기 처리
-   5. Projction 설계 전략
+   5. Projection 설계 전략
 3. 아키텍처의 선택
    1. 모놀리식 vs. MSA
 4. 데이터 계층 설계
@@ -158,7 +158,7 @@
 - 데이터의 일관성을 보장.
 - 성능을 저하시키고, 확장 비용 증대.
 - 분산 환경에서 구현 난이도가 높음.
-### 최종 일관성 (Eventually Consistency)
+### 최종 일관성 (Eventual Consistency)
 - 일시적인 데이터 불일치를 허용하고, 시간이 지나면 수렴함.
 - 데이터의 변경이 즉시 수정되지 않을수도 있음.
 - 비동기 기반.
@@ -402,7 +402,7 @@ A -> B -> C
 | LocalDateTime | createdAt           | ``                                                           |
 | LocalDateTime | modifiedAt          | ``                                                           |
 | Long          | articleCommentCount | ``ArticleCommentCountRepository``로부터 fetch한 댓글 수.            |
-| Long          | articleLikeCount    | ``ArticleLikeCountRepository``로부터 fetch한 댓글 수.               |
+| Long          | articleLikeCount    | ``ArticleLikeCountRepository``로부터 fetch한 좋아요 수.               |
 | 팩토리 메서드       | create              | Kafka가 생성한 이벤트, 또는 DB에서 fetch한 내용을 기반으로 ``ArticleQueryModel``을 생성하는 팩토리 메서드. |
 | Setter        | updateBy            | Kafka가 생성한 이벤트를 기반으로 ``ArticleQueryModel``을 갱신하는 메서드.        |
 - 조회수 역시 조회 모델 생성에 필요하지만, 
