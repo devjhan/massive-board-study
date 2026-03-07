@@ -477,6 +477,14 @@ DB의 스키마 변경과 모델의 변경을 분리할 것.
 - 비즈니스 요구사항을 기준으로 응집도가 높은 기능을 하나의 서비스로 묶음.
   - 게시글, 댓글, 좋아요, 조회수를 각각 독립적인 서비스로 획정하여 데이터와 로직을 격리함.
 - 데이터 산재로 인한 조회 성능 저하를 방지하기 위해 article-read와 같은 읽기 전용 서비스를 별도로 두어 경계를 최적화함.
+| 서비스                      | 역할                                         |
+|--------------------------|--------------------------------------------|
+| ``service:article``      | 게시글 생명주기 제어                                |
+| ``service:comment``      | 댓글 계층구조 정의 · 비즈니스 로직                       |
+| ``service:like``         | 좋아요 중복방지 제어 · 비즈니스 로직                      |
+| ``service:view``         | Redis 중심 조회수 배치 처리                         |
+| ``service:hot-article``  | 이벤트 스트리밍 및 ``HotArticleScoreUpdater`` 스코어링 |
+| ``service:article-read`` | CQRS Read 전용 서비스                           |
 ### 데이터베이스 분리 전략
 - 각 서비스는 자신만이 제어할 수 있는 전용 저장소를 가져야 함. 타 서비스의 데이터베이스에 직접 접근하는 것은 결합도를 높이므로 지양함.
 - 도메인 특성에 따라 view 서비스는 고성능 처리를 위해 Redis와 RDB를 병행하고, article-read는 프로젝션 모델을 위해 Redis를 주 저장소로 사용하는 등 서비스별 최적의 스택을 선택할 수 있음.
@@ -502,7 +510,7 @@ DB의 스키마 변경과 모델의 변경을 분리할 것.
 ### 샤딩 전략
 데이터 규모가 단일 장비의 저장 용량, 처리 성능(IOPS)를 초과하는 상황을 해결하기 위한 데이터 분산 전략. 
 #### 종류
-##### Horizontal Sharding
+##### Horizontal Sharding (채택)
 - 행 단위 분리.
 - 높은 확장성.
 - JOIN, 트랜잭션 복잡도 높음.
@@ -512,16 +520,31 @@ DB의 스키마 변경과 모델의 변경을 분리할 것.
 ##### Shard Key
 - Range 기반 -> 범위 조회 유리함. 데이터가 쏠릴 수 있음.
 - Hash 기반 -> 균등 분산. 범위 조회에 불리함.
-#### 적용
+#### 어플리케이션 단위 샤딩 | ``AssignShard``
+분산 환경에서 DB에 정상 발행에 실패한 메시지가 남아 있으며, 복수의 ``MessageRelay``  인스턴스가 존재할 경우, 발행 작업의 중복을 방지하고 부하를 분산함. | **Load Balancer**
 - 샤드 코디네이터 | ``MessageRelayCoordinator``
   - 분산 환경에서 ``MessageRelay``가 동일한 이벤트를 중복 처리하지 않도록 인스턴스별 처리 범위를 할당함.
   - ``assignShards()`` 메서드를 통해 프로세스 별로 샤드를 지정하여 시스템의 처리량을 선형적으로 확장할 수 있음.
-- 샤드 기반 폴링&처리 | ``MessageRelay``
+  - 3초마다 ``ping()`` 메서드를 통해 각 인스턴스의 ``APP_ID``, 타임스탬프를 갱신함.
+  - 9초간 응답이 없는 인스턴스는 자동으로 목록에서 제거됨.
+- 샤드 기반 폴링 및 처리 | ``MessageRelay``
   - ``@TransactionalEventListener(phase=TransactionPhase.BEFORE_COMMIT)`` 어노테이션을 이용해, 각각의 서비스가 메시지를 발행할 경우, 각 서비스의 비즈니스 로직과 이벤트의 저장을 원자화함.
   - ``@Async("messageRelayPublishEventExecutor")
-    @TransactionalEventListener(phase = TransactionPhase.*AFTER_COMMIT*)
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     `` 어노테이션을 활용해, 폴링을 기다리지 않고 즉시 메시지를 발행한 뒤, Kafka로 전송하고 삭제함.
-  - 발행에 실패, 지연된 데이터는 ``publishPendingEvent()`` 쓰레드를 이용하여 At-least-once delivery를 보장함.
+    - 위 경로로 발행된 경우, **어플리케이션 인스턴스가 자신이 생산한 메시지를 직접 처리하기 때문에 ``AssignShard``를 할당받지 않고 즉시 처리함.**
+    - 위 경로로 발행되지 못한 경우,``publishPendingEvent()`` 쓰레드를 이용하여 At-least-once delivery를 보장함. 이 경우, 여러 ``MessageRelay``가 공동으로 처리하기 때문에 ``AssignShard``를 할당받아 처리함.
+#### 물리적 샤딩 | Shard Key
+엔티티를 물리적으로 그룹화하고, 처리 순서를 보장함.
+- ``MessageRelay``는 Kafka로 메시지를 보낼 때, shardKey를 메시지 키로 사용함.
+- 동일한 shardKey를 가진 메시지는 동일한 Kafka 파티션에 적재되므로, Consumer가 이벤트를 발생 순서대로 처리할 수 있게 하여 최종 일관성의 정합성을 높임.
+  - 단, ``publishPendingEvent()`` 스케줄러로 발행된 메시지의 경우, 순서가 어긋날 수 있음.
+| 엔티티                                               | 샤드 키      | 사유                                                           |
+|---------------------------------------------------|-----------|--------------------------------------------------------------|
+| service:article:Article,<br>BoardArticleCount     | boardId   | 개별 ``Article``은 ``Board`` 단위로 조회되기 때문에, 게시판 단위로 일관성을 유지하기 위함. |
+| service:comment:CommentV2,<br>ArticleCommentCount | articleId | 논리적으로 개별 	``Article``에 종속되기 때문에, 통계 갱신 및 조회 모델과의 일관성을 게시글 단위로 유지하기 위함. |
+| service:like:ArticleLike,<br>ArticleLikeCount     | articleId | 논리적으로 개별 	``Article``에 종속되기 때문에, 통계 갱신 및 조회 모델과의 일관성을 게시글 단위로 유지하기 위함. |
+| service:ArticleViewCount                          | articleId | 논리적으로 개별 	``Article``에 종속되기 때문에, 통계 갱신 및 조회 모델과의 일관성을 게시글 단위로 유지하기 위함. |
 ### 분산 환경에서의 유일성 보장
 #### Auto Increment
 - 분산 환경에서 유일성 보장 못함.
